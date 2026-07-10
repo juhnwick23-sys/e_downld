@@ -42,28 +42,58 @@ jobs:
             echo "$YOUTUBE_COOKIES" > youtube-cookies.txt
             echo "✅ YouTube cookies written from secret."
           else
-            echo "ℹ️ No YOUTUBE_COOKIES secret – proceeding without cookies."
+            echo "⚠️ No YOUTUBE_COOKIES secret — این حالا تقریباً همیشه لازمه"
           fi
         env:
           YOUTUBE_COOKIES: ${{ secrets.YOUTUBE_COOKIES }}
 
-      # ✅ FIX 1: v1.x → 2.x  (حداقل نیاز yt-dlp/EJS = Deno 2.0.0)
       - name: Install Deno Runtime
         uses: denoland/setup-deno@v1
         with:
           deno-version: 2.x
 
+      # ═══════════════════════════════════════════════════════════
+      # ✅ جدید: راه‌اندازی PO Token Provider
+      # سرویسی که واقعاً PO Token معتبر تولید می‌کند (رسمی، نگهداری‌شده
+      # توسط تیم yt-dlp) — این ریشه‌ی اصلی مشکل «403 Forbidden» را حل می‌کند
+      # ═══════════════════════════════════════════════════════════
+      - name: Start PO Token Provider server
+        run: |
+          docker run --name bgutil-provider -d --init -p 4416:4416 \
+            brainicism/bgutil-ytdlp-pot-provider
+
+          echo "⏳ صبر برای بالا آمدن سرور..."
+          sleep 8
+          docker ps
+          docker logs bgutil-provider
+
+      - name: Install bgutil PO Token plugin for yt-dlp
+        run: |
+          # ✅ رفع باگ: طبق مستندات رسمی، باید خود فایل zip (بدون extract)
+          # مستقیماً در پوشه‌ی plugin قرار بگیره — yt-dlp خودش zip رو می‌خونه
+          PLUGIN_DIR="$HOME/.config/yt-dlp/plugins"
+          mkdir -p "$PLUGIN_DIR"
+          curl -sL \
+            https://github.com/Brainicism/bgutil-ytdlp-pot-provider/releases/latest/download/bgutil-ytdlp-pot-provider.zip \
+            -o "$PLUGIN_DIR/bgutil-ytdlp-pot-provider.zip"
+          echo "✅ Plugin zip placed at:"
+          ls -la "$PLUGIN_DIR"
+
       - name: Install System Dependencies
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq jq ffmpeg python3-pip
-          # ✅ FIX 2: pip install yt-dlp-ejs حذف شد (بی‌اثر بود)
-          # چون yt-dlp را از binary نصب می‌کنیم، پکیج pip تأثیری ندارد
           python3 -m pip install requests --break-system-packages || \
           python3 -m pip install requests
           sudo curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp \
             -o /usr/local/bin/yt-dlp
           sudo chmod a+rx /usr/local/bin/yt-dlp
+
+      # ✅ تأیید فعال بودن PO Token Provider قبل از دانلود واقعی
+      - name: Verify PO Token Provider is detected
+        run: |
+          yt-dlp -v --skip-download "${{ github.event.inputs.url }}" 2>&1 | grep -i "pot" || \
+            echo "⚠️ هشدار: provider در خروجی verbose دیده نشد — ممکنه مشکلی باشه"
 
       - name: Create Temp Directory
         id: tempdir
@@ -104,18 +134,19 @@ jobs:
 
           echo "🌐 Global defaults: type=$GLOBAL_TYPE quality=$GLOBAL_VAL"
 
-          # ✅ FIX 3: از -s (non-empty) به جای -f (exists) برای چک کوکی
-          # بدون این، فایل خالی هم باعث skip شدن iOS client می‌شد
           COOKIE_ARGS=""
           if [ -f youtube-cookies.txt ] && [ -s youtube-cookies.txt ]; then
             COOKIE_ARGS="--cookies youtube-cookies.txt"
           fi
 
-          # ✅ FIX 4: --remote-components ejs:github جایگزین --js-runtimes deno شد
-          # این روش EJS را از GitHub دانلود می‌کند (همیشه به‌روز، با هر runtime کار می‌کند)
+          # ✅ ساده شد: چون PO Token واقعی داریم، دیگه نیازی به دو پاس
+          # جداگانه (iOS بدون کوکی / mweb با کوکی) نیست.
+          # کوکی + PO Token Provider فعال = هر دو مانع قبلی حل شده.
+          # نیازی به extractor-arg خاص po_token نیست — bgutil خودکار
+          # شناسایی و استفاده می‌شود.
           YT_DLP_ARGS="$COOKIE_ARGS \
             --remote-components ejs:github \
-            --extractor-args youtube:player_client=ios,tv,web_embedded \
+            --extractor-args youtube:player_client=mweb,tv,web_embedded \
             --no-progress"
 
           FAILED_ENTRIES='[]'
@@ -131,13 +162,9 @@ jobs:
             echo "🔧 Type: $type | Quality: $val"
 
             if [ "$type" = "a" ]; then
-              if [ "$val" = "max" ]; then
-                FORMAT_STR="bestaudio/best"
-              elif [ "$val" = "min" ]; then
-                FORMAT_STR="worstaudio/worst"
-              else
-                FORMAT_STR="bestaudio[abr<=${val}]/bestaudio/best"
-              fi
+              if [ "$val" = "max" ]; then FORMAT_STR="bestaudio/best"
+              elif [ "$val" = "min" ]; then FORMAT_STR="worstaudio/worst"
+              else FORMAT_STR="bestaudio[abr<=${val}]/bestaudio/best"; fi
               echo "🎵 Audio format string: $FORMAT_STR"
               if yt-dlp $YT_DLP_ARGS \
                   -f "$FORMAT_STR" \
@@ -151,13 +178,9 @@ jobs:
                   jq ". + [{link: \"$link\", type: \"$type\", val: \"$val\"}]")
               fi
             else
-              if [ "$val" = "max" ]; then
-                FORMAT_STR="bestvideo+bestaudio/best"
-              elif [ "$val" = "min" ]; then
-                FORMAT_STR="worstvideo+worstaudio/worst"
-              else
-                FORMAT_STR="bestvideo[height<=${val}]+bestaudio/best[height<=${val}]"
-              fi
+              if [ "$val" = "max" ]; then FORMAT_STR="bestvideo+bestaudio/best"
+              elif [ "$val" = "min" ]; then FORMAT_STR="worstvideo+worstaudio/worst"
+              else FORMAT_STR="bestvideo[height<=${val}]+bestaudio/best[height<=${val}]"; fi
               echo "🎬 Video format string: $FORMAT_STR"
               if yt-dlp $YT_DLP_ARGS \
                   -f "$FORMAT_STR" \
@@ -271,7 +294,7 @@ jobs:
             fi
             yt-dlp --force-ipv4 --retries 5 $COOKIE_ARGS \
               --remote-components ejs:github \
-              --extractor-args "youtube:player_client=ios,tv,web_embedded" \
+              --extractor-args "youtube:player_client=mweb,tv,web_embedded" \
               -f "$fmt" --merge-output-format mp4 \
               -o "$OUTPUT_FOLDER/%(title)s-${suf}.%(ext)s" "$1"
           }
@@ -315,7 +338,7 @@ jobs:
             fi
             yt-dlp $COOKIE_ARGS \
               --remote-components ejs:github \
-              --extractor-args "youtube:player_client=ios,web_music,tv,web_embedded" \
+              --extractor-args "youtube:player_client=web,ios,tv,web_embedded" \
               -f "$fmt" --merge-output-format mp4 \
               -o "$OUTPUT_FOLDER/%(title)s-${suf}.%(ext)s" "$1"
           }
@@ -360,15 +383,20 @@ jobs:
           git remote add origin \
             https://x-access-token:${{ secrets.SECOND_REPO_TOKEN }}@github.com/${{ github.repository_owner }}/my-files.git
           git push --force origin main
-          
+
       - name: Write job metadata signal
         if: github.event.inputs.job_id != ''
         run: |
           JOB_ID="${{ github.event.inputs.job_id }}"
-          
+
           cd /tmp/final_upload
           echo "{\"job_id\":\"$JOB_ID\",\"status\":\"ready\"}" > job_meta.json
-          
+
           git add job_meta.json
           git commit --amend --no-edit
           git push --force origin main
+
+      # ✅ پاکسازی سرویس پس‌زمینه
+      - name: Stop PO Token Provider
+        if: always()
+        run: docker stop bgutil-provider 2>/dev/null || true
